@@ -9,7 +9,10 @@ use std::{
         fd::{AsFd, FromRawFd, RawFd},
         unix::net::UnixStream,
     },
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex, MutexGuard,
+    },
 };
 
 use cctk::{
@@ -68,6 +71,7 @@ struct AppData {
     seat_state: SeatState,
     shm_state: Shm,
     activation_state: Option<ActivationState>,
+    screencopy_stop_flags: Vec<Arc<AtomicBool>>,
 }
 
 // Workspace and toplevel handling
@@ -360,22 +364,20 @@ struct CaptureData {
     capturer: Capturer,
 }
 
+struct CaptureContext {
+    session: Arc<Session>,
+    capture_session: CaptureSession,
+    width: u32,
+    height: u32,
+    buf_len: u32,
+}
+
 impl CaptureData {
-    pub fn capture_source_shm_fd<Fd: AsFd>(
+    fn create_capture_context(
         &self,
-        overlay_cursor: bool,
         source: &ExtForeignToplevelHandleV1,
-        fd: Fd,
-        len: Option<u32>,
-    ) -> Option<ShmImage<Fd>> {
-        // XXX error type?
-        // TODO: way to get cursor metadata?
-
-        #[allow(unused_variables)] // TODO
-        let overlay_cursor = if overlay_cursor { 1 } else { 0 };
-
+    ) -> Option<CaptureContext> {
         let session = Arc::new(Session::default());
-        // Unwrap assumes compositor supports this capture type
         let capture_session = self
             .capturer
             .create_session(
@@ -401,7 +403,6 @@ impl CaptureData {
             return None;
         }
 
-        // XXX
         if !formats.shm_formats.contains(&wl_shm::Format::Abgr8888) {
             tracing::error!("No suitable buffer format found");
             tracing::warn!("Available formats: {:#?}", formats);
@@ -409,38 +410,46 @@ impl CaptureData {
         }
 
         let buf_len = width * height * 4;
-        if let Some(len) = len {
-            if len != buf_len {
-                return None;
-            }
-        } else if let Err(_err) = rustix::fs::ftruncate(&fd, buf_len.into()) {
-        }
+        Some(CaptureContext {
+            session,
+            capture_session,
+            width,
+            height,
+            buf_len,
+        })
+    }
+
+    fn capture_frame<'a, Fd: AsFd>(
+        &self,
+        ctx: &CaptureContext,
+        fd: &'a Fd,
+    ) -> Option<ShmImage<'a, Fd>> {
         let pool = self
             .wl_shm
-            .create_pool(fd.as_fd(), buf_len as i32, &self.qh, ());
+            .create_pool(fd.as_fd(), ctx.buf_len as i32, &self.qh, ());
         let buffer = pool.create_buffer(
             0,
-            width as i32,
-            height as i32,
-            width as i32 * 4,
+            ctx.width as i32,
+            ctx.height as i32,
+            ctx.width as i32 * 4,
             wl_shm::Format::Abgr8888,
             &self.qh,
             (),
         );
 
-        capture_session.capture(
+        ctx.capture_session.capture(
             &buffer,
             &[],
             &self.qh,
             FrameData {
                 frame_data: ScreencopyFrameData::default(),
-                session: capture_session.clone(),
+                session: ctx.capture_session.clone(),
             },
         );
         self.conn.flush().unwrap();
 
-        // TODO: wait for server to release buffer?
-        let res = session
+        let res = ctx
+            .session
             .wait_while(|data| data.res.is_none())
             .res
             .take()
@@ -448,23 +457,26 @@ impl CaptureData {
         pool.destroy();
         buffer.destroy();
 
-        //std::thread::sleep(std::time::Duration::from_millis(16));
-
         if res.is_ok() {
-            Some(ShmImage { fd, width, height })
+            Some(ShmImage {
+                fd,
+                width: ctx.width,
+                height: ctx.height,
+            })
         } else {
             None
         }
     }
+
 }
 
-pub struct ShmImage<T: AsFd> {
-    fd: T,
+pub struct ShmImage<'a, T: AsFd> {
+    fd: &'a T,
     pub width: u32,
     pub height: u32,
 }
 
-impl<T: AsFd> ShmImage<T> {
+impl<T: AsFd> ShmImage<'_, T> {
     pub fn image(&self) -> anyhow::Result<image::RgbaImage> {
         let mmap = unsafe { memmap2::Mmap::map(&self.fd.as_fd())? };
         image::RgbaImage::from_raw(self.width, self.height, mmap.to_vec())
@@ -483,7 +495,7 @@ impl AppData {
             .clone()
     }
 
-    fn send_image(&self, handle: ExtForeignToplevelHandleV1) {
+    fn send_image(&mut self, handle: ExtForeignToplevelHandleV1) {
         let tx = self.tx.clone();
         let capture_data = CaptureData {
             qh: self.queue_handle.clone(),
@@ -491,6 +503,8 @@ impl AppData {
             wl_shm: self.shm_state.wl_shm().clone(),
             capturer: self.screencopy_state.capturer().clone(),
         };
+        let stop = Arc::new(AtomicBool::new(false));
+        self.screencopy_stop_flags.push(stop.clone());
         std::thread::spawn(move || {
             let name = c"app-list-screencopy";
             let Ok(fd) = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC) else {
@@ -498,9 +512,26 @@ impl AppData {
                 return;
             };
 
-            // XXX is this going to use to much memory?
-            let img = capture_data.capture_source_shm_fd(false, &handle, fd, None);
-            if let Some(img) = img {
+            let Some(ctx) = capture_data.create_capture_context(&handle) else {
+                tracing::error!("Failed to create capture context");
+                return;
+            };
+
+            if let Err(_err) = rustix::fs::ftruncate(&fd, ctx.buf_len.into()) {
+                tracing::error!("Failed to truncate memfd");
+                return;
+            }
+
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+
+                let Some(img) = capture_data.capture_frame(&ctx, &fd) else {
+                    tracing::error!("Failed to capture frame");
+                    return;
+                };
+
                 let Ok(img) = img.image() else {
                     tracing::error!("Failed to get RgbaImage");
                     return;
@@ -524,15 +555,24 @@ impl AppData {
                     img
                 };
 
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+
                 if let Err(err) =
-                    tx.unbounded_send(WaylandUpdate::Image(handle, WaylandImage::new(img)))
+                    tx.unbounded_send(WaylandUpdate::Image(handle.clone(), WaylandImage::new(img)))
                 {
                     tracing::error!("Failed to send image event to subscription {err:?}");
+                    return;
                 }
-            } else {
-                tracing::error!("Failed to capture image");
             }
         });
+    }
+
+    fn stop_all_screencopy(&mut self) {
+        for flag in self.screencopy_stop_flags.drain(..) {
+            flag.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -619,6 +659,9 @@ pub(crate) fn wayland_handler(
     if handle
         .insert_source(rx, |event, (), state| match event {
             calloop::channel::Event::Msg(req) => match req {
+                WaylandRequest::StopScreencopy => {
+                    state.stop_all_screencopy();
+                }
                 WaylandRequest::Screencopy(handle) => {
                     state.send_image(handle.clone());
                 }
@@ -703,6 +746,7 @@ pub(crate) fn wayland_handler(
         shm_state: Shm::bind(&globals, &qh).unwrap(),
         activation_state: ActivationState::bind::<AppData>(&globals, &qh).ok(),
         queue_handle: qh,
+        screencopy_stop_flags: Vec::new(),
     };
 
     loop {

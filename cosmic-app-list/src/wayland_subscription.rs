@@ -146,6 +146,7 @@ pub enum WaylandRequest {
         terminal: bool,
     },
     Screencopy(ExtForeignToplevelHandleV1),
+    StopScreencopy,
 }
 
 #[derive(Debug, Clone)]
