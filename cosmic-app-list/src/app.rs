@@ -386,6 +386,7 @@ struct CosmicAppList {
     active_workspaces: Vec<ExtWorkspaceHandleV1>,
     output_list: FxHashMap<WlOutput, OutputInfo>,
     locales: Vec<String>,
+    last_activated_toplevel: FxHashMap<String, ExtForeignToplevelHandleV1>,
     hovered_toplevel: Option<ExtForeignToplevelHandleV1>,
     popup_toplevel_drag: Option<PopupToplevelDrag>,
     overflow_favorites_popup: Option<window::Id>,
@@ -846,7 +847,6 @@ impl CosmicAppList {
         if self.active_workspaces.is_empty() {
             return Vec::new();
         }
-        let current_output = &self.core.applet.output_name;
         let mut focused_toplevels: Vec<ExtForeignToplevelHandleV1> = Vec::new();
         let active_workspaces = &self.active_workspaces;
         for toplevel_list in self.active_list.iter().chain(self.pinned_list.iter()) {
@@ -855,11 +855,6 @@ impl CosmicAppList {
                     && active_workspaces
                         .iter()
                         .any(|workspace| t_info.workspace.contains(workspace))
-                    && t_info.output.iter().any(|x| {
-                        self.output_list.get(x).is_some_and(|val| {
-                            val.name.as_ref().is_some_and(|n| n == current_output)
-                        })
-                    })
                 {
                     focused_toplevels.push(t_info.foreign_toplevel.clone());
                 }
@@ -1195,11 +1190,37 @@ impl cosmic::Application for CosmicAppList {
                 }
 
                 if let Some(tx) = self.wayland_sender.as_ref() {
-                    let _ = tx.send(WaylandRequest::Toplevel(if self.is_focused(&handle) {
-                        ToplevelRequest::Minimize(handle)
-                    } else {
-                        ToplevelRequest::Activate(handle)
-                    }));
+                    let toplevel_info = self
+                        .active_list
+                        .iter()
+                        .chain(self.pinned_list.iter())
+                        .flat_map(|item| &item.toplevels)
+                        .find(|(info, _)| info.foreign_toplevel == handle)
+                        .map(|(info, _)| info);
+
+                    let is_minimized = toplevel_info
+                        .is_some_and(|info| info.state.contains(&State::Minimized));
+
+                    let was_last_focused_on_its_output = toplevel_info.is_some_and(|info| {
+                        info.output.iter().any(|wl_output| {
+                            self.output_list
+                                .get(wl_output)
+                                .and_then(|oi| oi.name.as_ref())
+                                .is_some_and(|name| {
+                                    self.last_activated_toplevel
+                                        .get(name)
+                                        .is_some_and(|h| *h == handle)
+                                })
+                        })
+                    });
+
+                    let _ = tx.send(WaylandRequest::Toplevel(
+                        if !is_minimized && was_last_focused_on_its_output {
+                            ToplevelRequest::Minimize(handle)
+                        } else {
+                            ToplevelRequest::Activate(handle)
+                        },
+                    ));
                 }
                 if let Some(p) = self.popup.take() {
                     return destroy_popup(p.id);
@@ -1478,6 +1499,8 @@ impl cosmic::Application for CosmicAppList {
                             }
                         }
                         ToplevelUpdate::Remove(handle) => {
+                            self.last_activated_toplevel
+                                .retain(|_, h| *h != handle);
                             for t in self
                                 .active_list
                                 .iter_mut()
@@ -1508,6 +1531,20 @@ impl cosmic::Application for CosmicAppList {
                             if info.app_id.is_empty() {
                                 return Task::none();
                             }
+
+                            if info.state.contains(&State::Activated) {
+                                for wl_output in &info.output {
+                                    if let Some(output_info) = self.output_list.get(wl_output) {
+                                        if let Some(name) = &output_info.name {
+                                            self.last_activated_toplevel.insert(
+                                                name.clone(),
+                                                info.foreign_toplevel.clone(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
                             let mut updated_appid = false;
 
                             'toplevel_loop: for toplevel_list in self
