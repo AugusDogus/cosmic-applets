@@ -727,6 +727,7 @@ impl CosmicAppList {
     fn close_popups(&mut self) -> Task<cosmic::Action<Message>> {
         let mut commands = Vec::new();
         if let Some(popup) = self.popup.take() {
+            self.stop_screencopy();
             commands.push(destroy_popup(popup.id));
         }
         if let Some(popup) = self.overflow_active_popup.take() {
@@ -736,6 +737,12 @@ impl CosmicAppList {
             commands.push(destroy_popup(popup));
         }
         Task::batch(commands)
+    }
+
+    fn stop_screencopy(&self) {
+        if let Some(tx) = self.wayland_sender.as_ref() {
+            let _ = tx.send(WaylandRequest::StopScreencopy);
+        }
     }
 
     /// Returns the length of the group in the favorite list after which items are displayed in a popup.
@@ -913,6 +920,7 @@ impl cosmic::Application for CosmicAppList {
     fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
         match message {
             Message::Popup(id, parent_window_id) => {
+                self.stop_screencopy();
                 if let Some(Popup {
                     parent,
                     id: popup_id,
@@ -973,6 +981,7 @@ impl cosmic::Application for CosmicAppList {
                 }
             }
             Message::ToplevelListPopup(id, parent_window_id) => {
+                self.stop_screencopy();
                 if let Some(Popup {
                     parent,
                     id: popup_id,
@@ -1104,6 +1113,7 @@ impl cosmic::Application for CosmicAppList {
                     );
                     self.pinned_list.push(entry);
                 }
+                self.stop_screencopy();
                 if let Some(Popup { id: popup_id, .. }) = self.popup.take() {
                     return destroy_popup(popup_id);
                 }
@@ -1122,6 +1132,7 @@ impl cosmic::Application for CosmicAppList {
                         self.active_list.push(entry);
                     }
                 }
+                self.stop_screencopy();
                 if let Some(Popup { id: popup_id, .. }) = self.popup.take() {
                     return destroy_popup(popup_id);
                 }
@@ -1130,6 +1141,7 @@ impl cosmic::Application for CosmicAppList {
                 if let Some(tx) = self.wayland_sender.as_ref() {
                     let _ = tx.send(WaylandRequest::Toplevel(ToplevelRequest::Activate(handle)));
                 }
+                self.stop_screencopy();
                 if let Some(p) = self.popup.take() {
                     return destroy_popup(p.id);
                 }
@@ -1174,6 +1186,7 @@ impl cosmic::Application for CosmicAppList {
                         },
                     ));
                 }
+                self.stop_screencopy();
                 if let Some(p) = self.popup.take() {
                     return destroy_popup(p.id);
                 }
@@ -1198,6 +1211,7 @@ impl cosmic::Application for CosmicAppList {
                         }
                     }
                 }
+                self.stop_screencopy();
                 if let Some(Popup { id: popup_id, .. }) = self.popup.take() {
                     return destroy_popup(popup_id);
                 }
@@ -1473,6 +1487,7 @@ impl cosmic::Application for CosmicAppList {
 
                                 if popup.dock_item.toplevels.is_empty() {
                                     let id = popup.id;
+                                    self.stop_screencopy();
                                     self.popup = None;
                                     return destroy_popup(id);
                                 }
@@ -1625,6 +1640,7 @@ impl cosmic::Application for CosmicAppList {
                 }
             },
             Message::ClosePopup => {
+                self.stop_screencopy();
                 if let Some(p) = self.popup.take() {
                     return destroy_popup(p.id);
                 }
@@ -1676,6 +1692,7 @@ impl cosmic::Application for CosmicAppList {
             }
             Message::CloseRequested(id) => {
                 if Some(id) == self.popup.as_ref().map(|p| p.id) {
+                    self.stop_screencopy();
                     self.popup = None;
                 }
                 if self.overflow_active_popup.is_some_and(|p| p == id) {
