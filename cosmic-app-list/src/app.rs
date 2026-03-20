@@ -369,7 +369,6 @@ struct CosmicAppList {
     active_workspaces: Vec<ExtWorkspaceHandleV1>,
     output_list: FxHashMap<WlOutput, OutputInfo>,
     locales: Vec<String>,
-    last_activated_toplevel: FxHashMap<String, ExtForeignToplevelHandleV1>,
     hovered_toplevel: Option<ExtForeignToplevelHandleV1>,
     popup_toplevel_drag: Option<PopupToplevelDrag>,
     overflow_favorites_popup: Option<window::Id>,
@@ -1165,21 +1164,12 @@ impl cosmic::Application for CosmicAppList {
                     let is_minimized = toplevel_info
                         .is_some_and(|info| info.state.contains(&State::Minimized));
 
-                    let was_last_focused_on_its_output = toplevel_info.is_some_and(|info| {
-                        info.output.iter().any(|wl_output| {
-                            self.output_list
-                                .get(wl_output)
-                                .and_then(|oi| oi.name.as_ref())
-                                .is_some_and(|name| {
-                                    self.last_activated_toplevel
-                                        .get(name)
-                                        .is_some_and(|h| *h == handle)
-                                })
-                        })
-                    });
+                    // Minimize only when Wayland reports this toplevel as focused;
+                    // per-output "last activated" cache could stay stale after focus moved away.
+                    let should_minimize = !is_minimized && self.is_focused(&handle);
 
                     let _ = tx.send(WaylandRequest::Toplevel(
-                        if !is_minimized && was_last_focused_on_its_output {
+                        if should_minimize {
                             ToplevelRequest::Minimize(handle)
                         } else {
                             ToplevelRequest::Activate(handle)
@@ -1465,8 +1455,6 @@ impl cosmic::Application for CosmicAppList {
                             }
                         }
                         ToplevelUpdate::Remove(handle) => {
-                            self.last_activated_toplevel
-                                .retain(|_, h| *h != handle);
                             for t in self
                                 .active_list
                                 .iter_mut()
@@ -1497,19 +1485,6 @@ impl cosmic::Application for CosmicAppList {
                             // TODO probably want to make sure it is removed
                             if info.app_id.is_empty() {
                                 return Task::none();
-                            }
-
-                            if info.state.contains(&State::Activated) {
-                                for wl_output in &info.output {
-                                    if let Some(output_info) = self.output_list.get(wl_output) {
-                                        if let Some(name) = &output_info.name {
-                                            self.last_activated_toplevel.insert(
-                                                name.clone(),
-                                                info.foreign_toplevel.clone(),
-                                            );
-                                        }
-                                    }
-                                }
                             }
 
                             let mut updated_appid = false;
