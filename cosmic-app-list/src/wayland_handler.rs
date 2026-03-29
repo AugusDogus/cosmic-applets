@@ -10,8 +10,8 @@ use std::{
         unix::net::UnixStream,
     },
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -467,7 +467,6 @@ impl CaptureData {
             None
         }
     }
-
 }
 
 pub struct ShmImage<'a, T: AsFd> {

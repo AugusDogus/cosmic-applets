@@ -52,13 +52,7 @@ use cosmic_app_list_config::{APP_ID, AppListConfig};
 use cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::State;
 use futures::future::pending;
 use rustc_hash::FxHashMap;
-use std::{
-    borrow::Cow,
-    path::PathBuf,
-    rc::Rc,
-    str::FromStr,
-    time::Duration,
-};
+use std::{borrow::Cow, path::PathBuf, rc::Rc, str::FromStr, time::Duration};
 use switcheroo_control::Gpu;
 use tokio::time::sleep;
 use url::Url;
@@ -642,6 +636,36 @@ fn find_desktop_entries<'a>(
 }
 
 impl CosmicAppList {
+    fn dock_item_order_key(dock_item: &DockItem) -> &str {
+        dock_item.desktop_info.id()
+    }
+
+    fn apply_saved_toplevel_order_with_config(config: &AppListConfig, dock_item: &mut DockItem) {
+        let Some(saved_order) = config
+            .window_order
+            .get(Self::dock_item_order_key(dock_item))
+        else {
+            return;
+        };
+
+        dock_item.toplevels.sort_by_key(|(info, _)| {
+            saved_order
+                .iter()
+                .position(|identifier| identifier == &info.identifier)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    fn apply_saved_toplevel_orders(&mut self) {
+        for dock_item in self
+            .active_list
+            .iter_mut()
+            .chain(self.pinned_list.iter_mut())
+        {
+            Self::apply_saved_toplevel_order_with_config(&self.config, dock_item);
+        }
+    }
+
     fn dock_item_mut(&mut self, id: u32) -> Option<&mut DockItem> {
         if let Some(dock_item) = self.pinned_list.iter_mut().find(|item| item.id == id) {
             Some(dock_item)
@@ -664,7 +688,7 @@ impl CosmicAppList {
             return false;
         };
 
-        let reordered_toplevels = {
+        let (reordered_toplevels, order_key, identifiers) = {
             let Some(dock_item) = self.dock_item_mut(dock_item_id) else {
                 return false;
             };
@@ -691,10 +715,28 @@ impl CosmicAppList {
 
             let toplevel = dock_item.toplevels.remove(source_index);
             dock_item.toplevels.insert(target_index, toplevel);
-            dock_item.toplevels.clone()
+            (
+                dock_item.toplevels.clone(),
+                Self::dock_item_order_key(dock_item).to_string(),
+                dock_item
+                    .toplevels
+                    .iter()
+                    .map(|(info, _)| info.identifier.clone())
+                    .collect::<Vec<_>>(),
+            )
         };
 
-        if let Some(popup) = self.popup.as_mut().filter(|popup| popup.dock_item.id == dock_item_id) {
+        self.config.update_window_order(
+            order_key,
+            identifiers,
+            &Config::new(APP_ID, AppListConfig::VERSION).unwrap(),
+        );
+
+        if let Some(popup) = self
+            .popup
+            .as_mut()
+            .filter(|popup| popup.dock_item.id == dock_item_id)
+        {
             popup.dock_item.toplevels = reordered_toplevels;
         }
 
@@ -1161,20 +1203,18 @@ impl cosmic::Application for CosmicAppList {
                         .find(|(info, _)| info.foreign_toplevel == handle)
                         .map(|(info, _)| info);
 
-                    let is_minimized = toplevel_info
-                        .is_some_and(|info| info.state.contains(&State::Minimized));
+                    let is_minimized =
+                        toplevel_info.is_some_and(|info| info.state.contains(&State::Minimized));
 
                     // Minimize only when Wayland reports this toplevel as focused;
                     // per-output "last activated" cache could stay stale after focus moved away.
                     let should_minimize = !is_minimized && self.is_focused(&handle);
 
-                    let _ = tx.send(WaylandRequest::Toplevel(
-                        if should_minimize {
-                            ToplevelRequest::Minimize(handle)
-                        } else {
-                            ToplevelRequest::Activate(handle)
-                        },
-                    ));
+                    let _ = tx.send(WaylandRequest::Toplevel(if should_minimize {
+                        ToplevelRequest::Minimize(handle)
+                    } else {
+                        ToplevelRequest::Activate(handle)
+                    }));
                 }
                 self.stop_screencopy();
                 if let Some(p) = self.popup.take() {
@@ -1440,6 +1480,7 @@ impl cosmic::Application for CosmicAppList {
                                 })
                             {
                                 t.toplevels.push((info, None));
+                                Self::apply_saved_toplevel_order_with_config(&self.config, t);
                             } else {
                                 if info.app_id.is_empty() {
                                     info.app_id = format!("Unknown Application {}", self.item_ctr);
@@ -1533,6 +1574,7 @@ impl cosmic::Application for CosmicAppList {
                                     })
                                 {
                                     t.toplevels.push((info, None));
+                                    Self::apply_saved_toplevel_order_with_config(&self.config, t);
                                 } else {
                                     self.item_ctr += 1;
 
@@ -1664,6 +1706,7 @@ impl cosmic::Application for CosmicAppList {
                             }
                         })
                         .collect();
+                self.apply_saved_toplevel_orders();
             }
             Message::CloseRequested(id) => {
                 if Some(id) == self.popup.as_ref().map(|p| p.id) {
@@ -1800,11 +1843,9 @@ impl cosmic::Application for CosmicAppList {
                 }
             }
             Message::Released(id) => {
-                if self
-                    .popup
-                    .as_ref()
-                    .is_some_and(|popup| popup.id == id && popup.popup_type == PopupType::ToplevelList)
-                {
+                if self.popup.as_ref().is_some_and(|popup| {
+                    popup.id == id && popup.popup_type == PopupType::ToplevelList
+                }) {
                     self.popup_toplevel_drag = None;
                 }
             }
