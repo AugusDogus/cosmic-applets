@@ -447,18 +447,19 @@ impl CaptureData {
                 session: ctx.capture_session.clone(),
             },
         );
-        let res = {
-            self.conn.flush().ok()?;
-
+        let res = if self.conn.flush().is_ok() {
             let mut session_state = ctx
                 .session
                 .wait_while(|data| data.res.is_none() && !data.stopped);
-            let res = session_state.res.take()?;
+            let res = session_state.res.take();
             drop(session_state);
             res
+        } else {
+            None
         };
         pool.destroy();
         buffer.destroy();
+        let res = res?;
 
         if res.is_ok() {
             Some(ShmImage {
