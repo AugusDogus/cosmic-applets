@@ -695,7 +695,7 @@ pub(crate) fn wayland_handler(
                     if state.has_toplevel(&handle) {
                         state.send_image(handle.clone());
                     } else {
-                        tracing::debug!("Skipping screencopy request for stale toplevel");
+                        tracing::debug!(?handle, "Skipping screencopy request for stale toplevel");
                     }
                 }
                 WaylandRequest::Toplevel(req) => match req {
