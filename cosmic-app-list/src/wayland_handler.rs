@@ -447,13 +447,16 @@ impl CaptureData {
                 session: ctx.capture_session.clone(),
             },
         );
-        self.conn.flush().ok()?;
+        let res = {
+            self.conn.flush().ok()?;
 
-        let mut session_state = ctx
-            .session
-            .wait_while(|data| data.res.is_none() && !data.stopped);
-        let res = session_state.res.take()?;
-        drop(session_state);
+            let mut session_state = ctx
+                .session
+                .wait_while(|data| data.res.is_none() && !data.stopped);
+            let res = session_state.res.take()?;
+            drop(session_state);
+            res
+        };
         pool.destroy();
         buffer.destroy();
 
