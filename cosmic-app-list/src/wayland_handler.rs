@@ -10,8 +10,8 @@ use std::{
         unix::net::UnixStream,
     },
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -53,6 +53,7 @@ use cosmic_protocols::{
     toplevel_management::v1::client::zcosmic_toplevel_manager_v1,
 };
 use futures::channel::mpsc::UnboundedSender;
+use rustc_hash::FxHashMap;
 use sctk::{
     activation::{ActivationHandler, ActivationState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -71,7 +72,7 @@ struct AppData {
     seat_state: SeatState,
     shm_state: Shm,
     activation_state: Option<ActivationState>,
-    screencopy_stop_flags: Vec<Arc<AtomicBool>>,
+    screencopy_stop_flags: FxHashMap<ExtForeignToplevelHandleV1, Vec<Arc<AtomicBool>>>,
 }
 
 // Workspace and toplevel handling
@@ -267,6 +268,7 @@ impl ToplevelInfoHandler for AppData {
         _qh: &QueueHandle<Self>,
         toplevel: &ExtForeignToplevelHandleV1,
     ) {
+        self.stop_screencopy_for(toplevel);
         let _ = self
             .tx
             .unbounded_send(WaylandUpdate::Toplevel(ToplevelUpdate::Remove(
@@ -281,6 +283,7 @@ impl ToplevelInfoHandler for AppData {
 struct SessionInner {
     formats: Option<Formats>,
     res: Option<Result<(), WEnum<FailureReason>>>,
+    stopped: bool,
 }
 
 // TODO: dmabuf? need to handle modifier negotation
@@ -389,14 +392,12 @@ impl CaptureData {
                     session_data: ScreencopySessionData::default(),
                 },
             )
-            .unwrap();
-        self.conn.flush().unwrap();
+            .ok()?;
+        self.conn.flush().ok()?;
 
-        let formats = session
-            .wait_while(|data| data.formats.is_none())
-            .formats
-            .take()
-            .unwrap();
+        let mut session_state = session.wait_while(|data| data.formats.is_none() && !data.stopped);
+        let formats = session_state.formats.take()?;
+        drop(session_state);
         let (width, height) = formats.buffer_size;
 
         if width == 0 || height == 0 {
@@ -446,14 +447,13 @@ impl CaptureData {
                 session: ctx.capture_session.clone(),
             },
         );
-        self.conn.flush().unwrap();
+        self.conn.flush().ok()?;
 
-        let res = ctx
+        let mut session_state = ctx
             .session
-            .wait_while(|data| data.res.is_none())
-            .res
-            .take()
-            .unwrap();
+            .wait_while(|data| data.res.is_none() && !data.stopped);
+        let res = session_state.res.take()?;
+        drop(session_state);
         pool.destroy();
         buffer.destroy();
 
@@ -467,7 +467,6 @@ impl CaptureData {
             None
         }
     }
-
 }
 
 pub struct ShmImage<'a, T: AsFd> {
@@ -485,6 +484,10 @@ impl<T: AsFd> ShmImage<'_, T> {
 }
 
 impl AppData {
+    fn has_toplevel(&self, handle: &ExtForeignToplevelHandleV1) -> bool {
+        self.toplevel_info_state.info(handle).is_some()
+    }
+
     fn cosmic_toplevel(
         &self,
         handle: &ExtForeignToplevelHandleV1,
@@ -504,8 +507,15 @@ impl AppData {
             capturer: self.screencopy_state.capturer().clone(),
         };
         let stop = Arc::new(AtomicBool::new(false));
-        self.screencopy_stop_flags.push(stop.clone());
+        self.screencopy_stop_flags
+            .entry(handle.clone())
+            .or_default()
+            .push(stop.clone());
         std::thread::spawn(move || {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+
             let name = c"app-list-screencopy";
             let Ok(fd) = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC) else {
                 tracing::error!("Failed to get fd for capture");
@@ -528,7 +538,6 @@ impl AppData {
                 }
 
                 let Some(img) = capture_data.capture_frame(&ctx, &fd) else {
-                    tracing::error!("Failed to capture frame");
                     return;
                 };
 
@@ -570,8 +579,18 @@ impl AppData {
     }
 
     fn stop_all_screencopy(&mut self) {
-        for flag in self.screencopy_stop_flags.drain(..) {
-            flag.store(true, Ordering::Relaxed);
+        for flags in self.screencopy_stop_flags.drain().map(|(_, flags)| flags) {
+            for flag in flags {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn stop_screencopy_for(&mut self, handle: &ExtForeignToplevelHandleV1) {
+        if let Some(flags) = self.screencopy_stop_flags.remove(handle) {
+            for flag in flags {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -626,7 +645,13 @@ impl ScreencopyHandler for AppData {
         });
     }
 
-    fn stopped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _session: &CaptureSession) {}
+    fn stopped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, session: &CaptureSession) {
+        if let Some(session) = Session::for_session(session) {
+            session.update(|data| {
+                data.stopped = true;
+            });
+        }
+    }
 }
 
 pub(crate) fn wayland_handler(
@@ -663,7 +688,11 @@ pub(crate) fn wayland_handler(
                     state.stop_all_screencopy();
                 }
                 WaylandRequest::Screencopy(handle) => {
-                    state.send_image(handle.clone());
+                    if state.has_toplevel(&handle) {
+                        state.send_image(handle.clone());
+                    } else {
+                        tracing::debug!("Skipping screencopy request for stale toplevel");
+                    }
                 }
                 WaylandRequest::Toplevel(req) => match req {
                     ToplevelRequest::Activate(handle) => {
@@ -746,7 +775,7 @@ pub(crate) fn wayland_handler(
         shm_state: Shm::bind(&globals, &qh).unwrap(),
         activation_state: ActivationState::bind::<AppData>(&globals, &qh).ok(),
         queue_handle: qh,
-        screencopy_stop_flags: Vec::new(),
+        screencopy_stop_flags: FxHashMap::default(),
     };
 
     loop {
