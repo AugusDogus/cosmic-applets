@@ -2698,8 +2698,8 @@ impl cosmic::Application for CosmicAppList {
                 cosmic::iced::core::Event::Mouse(
                     cosmic::iced::core::mouse::Event::ButtonPressed(_),
                 ) => Some(Message::Pressed(id)),
-                cosmic::iced_core::Event::Mouse(
-                    cosmic::iced_core::mouse::Event::ButtonReleased(_),
+                cosmic::iced::core::Event::Mouse(
+                    cosmic::iced::core::mouse::Event::ButtonReleased(_),
                 ) => Some(Message::Released(id)),
                 _ => None,
             }),
